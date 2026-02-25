@@ -1,0 +1,356 @@
+-- Plumberly Database Schema (fixed ordering + safer bucket insert)
+
+-- Enable UUID extension
+create extension if not exists "uuid-ossp";
+
+-- =========================================================
+-- PROFILES
+-- =========================================================
+create table public.profiles (
+  id uuid references auth.users on delete cascade primary key,
+  email text not null,
+  full_name text not null,
+  phone text,
+  avatar_url text,
+  role text not null check (role in ('customer', 'plumber')),
+  created_at timestamptz default now() not null
+);
+
+alter table public.profiles enable row level security;
+
+create policy "Users can view own profile" on public.profiles
+  for select using (auth.uid() = id);
+
+create policy "Users can update own profile" on public.profiles
+  for update using (auth.uid() = id);
+
+-- NOTE: plumber->customer profile access policy is defined AFTER public.jobs exists.
+
+-- =========================================================
+-- SECURITY DEFINER HELPER FUNCTIONS
+-- These bypass RLS to avoid infinite recursion when policies
+-- on one table need to check data in another RLS-protected table.
+-- =========================================================
+create or replace function public.is_plumber()
+returns boolean as $$
+  select exists (
+    select 1 from public.profiles where id = auth.uid() and role = 'plumber'
+  );
+$$ language sql security definer stable;
+
+create or replace function public.is_customer()
+returns boolean as $$
+  select exists (
+    select 1 from public.profiles where id = auth.uid() and role = 'customer'
+  );
+$$ language sql security definer stable;
+
+create or replace function public.get_plumber_customer_ids(plumber_uuid uuid)
+returns setof uuid as $$
+  select customer_id from public.jobs where plumber_id = plumber_uuid;
+$$ language sql security definer stable;
+
+-- =========================================================
+-- PLUMBER DETAILS
+-- =========================================================
+create table public.plumber_details (
+  id uuid default uuid_generate_v4() primary key,
+  user_id uuid references public.profiles(id) on delete cascade not null unique,
+  regions text[] default '{}',
+  hourly_rate numeric(10,2) default 0,
+  bio text,
+  verified boolean default false,
+  rating numeric(3,2) default 0,
+  jobs_completed integer default 0,
+  business_name text not null default '',
+  services_type text check (services_type in ('gas', 'no_gas')) default 'no_gas',
+  gas_safe_number text,
+  gas_safe_verified boolean default false,
+  consent_to_checks boolean default false,
+  right_to_work text,
+  status text check (status in ('provisional', 'active', 'frozen', 'suspended')) default 'provisional',
+  provisional_jobs_remaining integer default 5,
+  payouts_enabled boolean default false,
+  frozen_reason text
+);
+
+alter table public.plumber_details enable row level security;
+
+create policy "Plumbers can view own details" on public.plumber_details
+  for select using (auth.uid() = user_id);
+
+create policy "Plumbers can update own details" on public.plumber_details
+  for update using (auth.uid() = user_id);
+
+create policy "Customers can view plumber details" on public.plumber_details
+  for select using (public.is_customer());
+
+-- =========================================================
+-- ENQUIRIES
+-- =========================================================
+create table public.enquiries (
+  id uuid default uuid_generate_v4() primary key,
+  customer_id uuid references public.profiles(id) on delete cascade not null,
+  title text not null,
+  description text not null default '',
+  status text not null default 'new'
+    check (status in ('new', 'accepted', 'in_progress', 'completed', 'cancelled')),
+  region text,
+  preferred_date date,
+  preferred_time text[] default '{}',
+  images text[] default '{}',
+  chatbot_transcript jsonb,
+  created_at timestamptz default now() not null,
+  updated_at timestamptz default now() not null
+);
+
+alter table public.enquiries enable row level security;
+
+create policy "Customers can view own enquiries" on public.enquiries
+  for select using (auth.uid() = customer_id);
+
+create policy "Customers can create enquiries" on public.enquiries
+  for insert with check (auth.uid() = customer_id);
+
+create policy "Customers can update own enquiries" on public.enquiries
+  for update using (auth.uid() = customer_id);
+
+create policy "Plumbers can view all enquiries" on public.enquiries
+  for select using (public.is_plumber());
+
+-- =========================================================
+-- JOBS
+-- =========================================================
+create table public.jobs (
+  id uuid default uuid_generate_v4() primary key,
+  enquiry_id uuid references public.enquiries(id) on delete cascade not null,
+  customer_id uuid references public.profiles(id) not null,
+  plumber_id uuid references public.profiles(id) not null,
+  status text not null default 'pending'
+    check (status in ('pending', 'quoted', 'accepted', 'in_progress', 'completed', 'cancelled')),
+  quote_amount numeric(10,2),
+  scheduled_date date,
+  scheduled_time text,
+  notes text,
+  quote_description text,
+  customer_confirmed boolean default false not null,
+  plumber_confirmed boolean default false not null,
+  verification_pin text,
+  pin_verified boolean default false not null,
+  created_at timestamptz default now() not null,
+  updated_at timestamptz default now() not null
+);
+
+alter table public.jobs enable row level security;
+
+create policy "Plumbers can view own jobs" on public.jobs
+  for select using (auth.uid() = plumber_id);
+
+create policy "Customers can view own jobs" on public.jobs
+  for select using (auth.uid() = customer_id);
+
+create policy "Plumbers can create jobs" on public.jobs
+  for insert with check (auth.uid() = plumber_id);
+
+create policy "Plumbers can update own jobs" on public.jobs
+  for update using (auth.uid() = plumber_id);
+
+create policy "Customers can update own jobs" on public.jobs
+  for update using (auth.uid() = customer_id);
+
+-- =========================================================
+-- PROFILES POLICY THAT DEPENDS ON JOBS (moved here)
+-- Uses SECURITY DEFINER helpers to avoid self-referencing recursion.
+-- =========================================================
+create policy "Plumbers can view customer profiles for their jobs" on public.profiles
+  for select using (
+    role = 'customer'
+    and public.is_plumber()
+    and id in (select public.get_plumber_customer_ids(auth.uid()))
+  );
+
+-- =========================================================
+-- AUTO-CREATE PROFILE ON SIGNUP
+-- =========================================================
+create or replace function public.handle_new_user()
+returns trigger as $$
+begin
+  insert into public.profiles (id, email, full_name, role)
+  values (
+    new.id,
+    new.email,
+    coalesce(new.raw_user_meta_data->>'full_name', ''),
+    coalesce(new.raw_user_meta_data->>'role', 'customer')
+  );
+
+  -- If plumber, also create plumber_details
+  if coalesce(new.raw_user_meta_data->>'role', 'customer') = 'plumber' then
+    insert into public.plumber_details (user_id, regions, hourly_rate, business_name, services_type, gas_safe_number, consent_to_checks, right_to_work)
+    values (
+      new.id,
+      case
+        when new.raw_user_meta_data->'regions' is not null
+             and jsonb_typeof(new.raw_user_meta_data->'regions') = 'array'
+        then array(select jsonb_array_elements_text(new.raw_user_meta_data->'regions'))
+        else '{}'::text[]
+      end,
+      coalesce((new.raw_user_meta_data->>'hourly_rate')::numeric, 0),
+      coalesce(new.raw_user_meta_data->>'business_name', ''),
+      coalesce(new.raw_user_meta_data->>'services_type', 'no_gas'),
+      new.raw_user_meta_data->>'gas_safe_number',
+      coalesce((new.raw_user_meta_data->>'consent_to_checks')::boolean, false),
+      new.raw_user_meta_data->>'right_to_work'
+    );
+  end if;
+
+  return new;
+end;
+$$ language plpgsql security definer;
+
+drop trigger if exists on_auth_user_created on auth.users;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute procedure public.handle_new_user();
+
+-- =========================================================
+-- UPDATED_AT TRIGGERS
+-- =========================================================
+create or replace function public.handle_updated_at()
+returns trigger as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists enquiries_updated_at on public.enquiries;
+create trigger enquiries_updated_at
+  before update on public.enquiries
+  for each row execute procedure public.handle_updated_at();
+
+drop trigger if exists jobs_updated_at on public.jobs;
+create trigger jobs_updated_at
+  before update on public.jobs
+  for each row execute procedure public.handle_updated_at();
+
+-- =========================================================
+-- ENABLE REALTIME
+-- =========================================================
+alter publication supabase_realtime add table public.enquiries;
+alter publication supabase_realtime add table public.jobs;
+
+-- =========================================================
+-- REVIEWS
+-- =========================================================
+create table public.reviews (
+  id uuid default uuid_generate_v4() primary key,
+  job_id uuid references public.jobs(id) on delete cascade not null unique,
+  customer_id uuid references public.profiles(id) on delete cascade not null,
+  plumber_id uuid references public.profiles(id) on delete cascade not null,
+  rating integer not null check (rating >= 1 and rating <= 5),
+  comment text,
+  created_at timestamptz default now() not null
+);
+
+alter table public.reviews enable row level security;
+
+create policy "Customers can insert reviews for own completed jobs" on public.reviews
+  for insert with check (
+    auth.uid() = customer_id
+    and exists (
+      select 1 from public.jobs
+      where jobs.id = job_id
+        and jobs.customer_id = auth.uid()
+        and jobs.status = 'completed'
+    )
+  );
+
+create policy "Plumbers can view own reviews" on public.reviews
+  for select using (auth.uid() = plumber_id);
+
+-- RPC: check if review exists (security definer, bypasses RLS for customers)
+create or replace function public.review_exists_for_job(p_job_id uuid)
+returns boolean as $$
+  select exists (
+    select 1 from public.reviews where job_id = p_job_id
+  );
+$$ language sql security definer stable;
+
+-- Trigger: recalculate plumber rating on review insert
+create or replace function public.update_plumber_rating()
+returns trigger as $$
+begin
+  update public.plumber_details
+  set rating = (
+    select coalesce(avg(rating), 0) from public.reviews where plumber_id = new.plumber_id
+  )
+  where user_id = new.plumber_id;
+  return new;
+end;
+$$ language plpgsql security definer;
+
+create trigger update_plumber_rating_trigger
+  after insert on public.reviews
+  for each row execute procedure public.update_plumber_rating();
+
+-- Trigger: increment jobs_completed when job transitions to completed
+create or replace function public.increment_jobs_completed()
+returns trigger as $$
+begin
+  if new.status = 'completed' and old.status != 'completed' then
+    update public.plumber_details
+    set jobs_completed = jobs_completed + 1,
+        provisional_jobs_remaining = greatest(provisional_jobs_remaining - 1, 0),
+        status = case
+          when status = 'provisional' and greatest(provisional_jobs_remaining - 1, 0) = 0 then 'active'
+          else status
+        end
+    where user_id = new.plumber_id;
+  end if;
+  return new;
+end;
+$$ language plpgsql security definer;
+
+create trigger increment_jobs_completed_trigger
+  after update on public.jobs
+  for each row execute procedure public.increment_jobs_completed();
+
+-- =========================================================
+-- STORAGE BUCKET FOR ENQUIRY IMAGES (safer re-run)
+-- =========================================================
+insert into storage.buckets (id, name, public)
+values ('enquiry-images', 'enquiry-images', true)
+on conflict (id) do nothing;
+
+create policy "Anyone can view enquiry images" on storage.objects
+  for select using (bucket_id = 'enquiry-images');
+
+create policy "Authenticated users can upload enquiry images" on storage.objects
+  for insert with check (bucket_id = 'enquiry-images' and auth.role() = 'authenticated');
+
+-- =========================================================
+-- FREEZE PLUMBER RPC (admin use)
+-- =========================================================
+create or replace function public.freeze_plumber(p_user_id uuid, p_reason text default null)
+returns void as $$
+begin
+  -- Only allow service_role (admin) to freeze plumbers
+  if current_setting('request.jwt.claim.role', true) != 'service_role' then
+    raise exception 'Unauthorized: only admins can freeze plumber accounts';
+  end if;
+
+  update public.plumber_details
+  set status = 'frozen',
+      frozen_reason = p_reason
+  where user_id = p_user_id;
+end;
+$$ language plpgsql security definer;
+
+-- =========================================================
+-- MIGRATION: Existing data
+-- Set verified plumbers to status = 'active', provisional_jobs_remaining = 0
+-- =========================================================
+-- UPDATE public.plumber_details
+-- SET status = 'active', provisional_jobs_remaining = 0
+-- WHERE verified = true;
