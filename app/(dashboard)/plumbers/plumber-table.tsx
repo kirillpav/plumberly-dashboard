@@ -11,6 +11,7 @@ import { Modal } from "@/components/ui/modal";
 import { PlumberWithProfile } from "@/lib/types/database";
 import { verifyPlumber, freezePlumber, updatePlumberStatus } from "./actions";
 import { CheckCircle, Snowflake, RotateCcw } from "lucide-react";
+import Link from "next/link";
 
 interface PlumberTableProps {
   plumbers: PlumberWithProfile[];
@@ -72,7 +73,12 @@ export function PlumberTable({ plumbers }: PlumberTableProps) {
       label: "Name",
       sortable: true,
       render: (row) => (
-        <span className="font-medium">{row.profiles.full_name}</span>
+        <Link
+          href={`/plumbers/${row.id}`}
+          className="font-medium text-primary hover:underline"
+        >
+          {row.profiles.full_name}
+        </Link>
       ),
       getValue: (row) => row.profiles.full_name,
     },
